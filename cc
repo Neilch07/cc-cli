@@ -925,16 +925,23 @@ _apply_profile() {
         fi
 
         # 写入 env.sh（终端环境变量）
-        # 同时 unset ANTHROPIC_AUTH_TOKEN，避免外部工具设置的 token 与 API_KEY 共存导致路由错乱
-        {
-            echo "unset ANTHROPIC_AUTH_TOKEN 2>/dev/null || true"
-            echo "export ANTHROPIC_API_KEY=\"$key\""
-            if [ -n "$url" ]; then
+        # 第三方网关（有自定义 URL）走 ANTHROPIC_AUTH_TOKEN（Authorization: Bearer），
+        # 否则走 ANTHROPIC_API_KEY（x-api-key）。Claude Code v2.1.x 对自定义 BASE_URL
+        # 用 API_KEY 时会预检失败报 "Not logged in · Please run /login"。
+        # 两个变量互斥导出，避免任一残留 token 与新设的 key 冲突。
+        if [ -n "$url" ]; then
+            {
+                echo "unset ANTHROPIC_API_KEY 2>/dev/null || true"
+                echo "export ANTHROPIC_AUTH_TOKEN=\"$key\""
                 echo "export ANTHROPIC_BASE_URL=\"$url\""
-            else
+            } > "$ENV_FILE"
+        else
+            {
+                echo "unset ANTHROPIC_AUTH_TOKEN 2>/dev/null || true"
+                echo "export ANTHROPIC_API_KEY=\"$key\""
                 echo "unset ANTHROPIC_BASE_URL 2>/dev/null || true"
-            fi
-        } > "$ENV_FILE"
+            } > "$ENV_FILE"
+        fi
     fi
 }
 
@@ -981,13 +988,16 @@ cmd_exec() {
     echo -e "${CYAN}临时使用 profile: ${BOLD}$name${NC} 执行命令..."
 
     # 在子 shell 中设置环境变量并执行
-    # unset ANTHROPIC_AUTH_TOKEN 防止父 shell 残留的 token 与 API_KEY 共存导致路由错乱
+    # 第三方网关（有 URL）走 ANTHROPIC_AUTH_TOKEN (Bearer)，否则走 ANTHROPIC_API_KEY (x-api-key)。
+    # 两者互斥，避免父 shell 或前一 profile 的残留与新设的 key 冲突。
     (
-        unset ANTHROPIC_AUTH_TOKEN 2>/dev/null || true
-        export ANTHROPIC_API_KEY="$key"
         if [ -n "$url" ]; then
+            unset ANTHROPIC_API_KEY 2>/dev/null || true
+            export ANTHROPIC_AUTH_TOKEN="$key"
             export ANTHROPIC_BASE_URL="$url"
         else
+            unset ANTHROPIC_AUTH_TOKEN 2>/dev/null || true
+            export ANTHROPIC_API_KEY="$key"
             unset ANTHROPIC_BASE_URL 2>/dev/null || true
         fi
         "$@"
