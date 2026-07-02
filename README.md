@@ -490,3 +490,18 @@ rm ~/.zsh_completion.d/_cc 2>/dev/null    # zsh 用户
 ## 协议
 
 MIT License
+
+## 姊妹工具：cx — Codex 多账号轮换
+
+与 `cc` 同一思路的 Codex CLI 版：**一个账号 = 一个独立 `CODEX_HOME` 目录**（`~/.codex-profiles/<名>/`），多个订阅账号共存互不覆盖，并支持**触限自动换号**。
+
+```bash
+ln -s "$(pwd)/cx" ~/.local/bin/cx   # 安装（与 cc 并列）
+
+cx add work        # 新建 profile 并交互登录（可反复 add 多个账号）
+cx list            # 列出各账号登录态与上次可用账号
+cx exec work -- exec --sandbox read-only "..."   # 指定账号执行 codex
+cx auto -- exec "..."   # 自动轮换：从上次可用账号开始，烧到 usage limit 自动换下一个
+```
+
+`auto` 模式的行为：命中 usage limit / 429 / quota 类错误 → 换下一个已登录账号重试（stdin 已缓存，heredoc/管道输入不会丢）；非触限的真实错误 → 如实透出并停止，不空烧其它账号；成功的账号记入 `~/.codex-profiles/.last_good`，下次优先。
