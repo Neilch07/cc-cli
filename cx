@@ -46,12 +46,12 @@ _backoff() { local n="$1" base; base=$(( 30 * (2 ** (n-1)) )); sleep $(( base + 
 cmd=${1:-help}; shift || true
 case "$cmd" in
   add)
-    name=${1:?用法: cx add <名>}
+    name=${1:?用法: cx add <名> [codex login 参数; 远程/headless 机器加 --device-auth]}; shift || true
     home="$PROF_ROOT/$name"; mkdir -p "$home"
     # 默认官方线路(订阅); 要走中转就 add 完手改 $home/config.toml 加 model_providers 段
     [ -f "$home/config.toml" ] || printf 'model = "gpt-5.5"\n' > "$home/config.toml"
-    echo "[cx] 开始登录 profile '$name'(订阅选 Sign in with ChatGPT):"
-    CODEX_HOME="$home" codex login
+    echo "[cx] 登录 profile '$name'(订阅选 Sign in with ChatGPT; ★远程/无浏览器机器请用: cx add $name --device-auth★):"
+    CODEX_HOME="$home" codex login "$@"
     ;;
   list)
     for d in "$PROF_ROOT"/*/; do
