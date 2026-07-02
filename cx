@@ -2,20 +2,51 @@
 # cx — Codex 多账号轮换器(cc-cli 家族成员, 与 cc 同装法; profile = 独立 CODEX_HOME 目录)
 # 用法:
 #   cx add <名>            # 新建 profile 并交互登录(订阅 OAuth 或贴 key)
-#   cx list                # 列出 profiles 与登录态
+#   cx list                # 列出 profiles 与登录态/今日用量
 #   cx exec <名> -- <codex参数...>   # 指定号执行
-#   cx auto -- <codex参数...>        # ★自动轮换: 依次试, 烧到 limit 换下一个号★
-# profile 目录: ~/.codex-profiles/<名>/ (各自 auth.json+config.toml, 互不影响)
+#   cx auto -- <codex参数...>        # ★合规轮换: 退避优先·换号次之·账号内日软上限★
+# profile 目录: ~/.codex-profiles/<名>/ (各自 auth.json+config.toml+.usage, 互不影响)
+#
+# ★合规防封原则★: 只做"守规矩的正常订阅用户"该有的节奏——时区/作息一致、触限先退避重试本号、
+#   账号内日软上限(不硬刷到限流那一刻)、账号间温和轮换。绝不做身份伪装/指纹规避(违反服务条款且加速封号)。
 set -u
+# 时区统一(默认新加坡): 作息时间戳一致, 消除地理/作息矛盾信号
+export TZ="${TZ:-Asia/Singapore}"
 PROF_ROOT="$HOME/.codex-profiles"
-STATE="$PROF_ROOT/.last_good"          # 记住上次能用的号, auto 模式从它开始试
-LIMIT_PAT='usage limit|rate.?limit|quota|429|insufficient_quota|limit reached|too many requests'
+STATE="$PROF_ROOT/.last_good"          # 记住上次能用的号, auto 从它开始
+LIMIT_PAT='usage limit|rate.?limit|quota|429|insufficient_quota|limit reached|too many requests|overloaded'
+# 温和节奏参数(环境变量可覆盖)
+CX_MIN_GAP="${CX_MIN_GAP:-25}"         # 同号两次调用最小间隔(秒)
+CX_JITTER="${CX_JITTER:-20}"           # 随机抖动上限(秒): 人不会精确等间隔
+CX_DAILY_CAP="${CX_DAILY_CAP:-40}"     # 每号每日软调用上限, 超则今日跳过该号(不硬刷到限流)
+CX_BACKOFF_TRIES="${CX_BACKOFF_TRIES:-3}"  # 触限后对【本号】指数退避重试次数, 仍不行才换号
 mkdir -p "$PROF_ROOT"
+
+_usage() { echo "${1%/}/.usage"; }     # 账号用量记账文件(1行:日期 2行:当日计数 3行:上次时间戳)
+# 今日是否仍在软上限内(0=可用 1=超额跳过)
+_quota_ok() {
+  local f day cd cn; f="$(_usage "$1")"; day="$(date +%Y%m%d)"
+  [ -f "$f" ] || return 0
+  cd="$(sed -n 1p "$f")"; cn="$(sed -n 2p "$f")"
+  [ "$cd" = "$day" ] || return 0
+  [ "${cn:-0}" -lt "$CX_DAILY_CAP" ]
+}
+# 调用前节流(距上次不足最小间隔就 sleep 带抖动)+ 计数
+_pace() {
+  local f day now last cd cn gap wait; f="$(_usage "$1")"; day="$(date +%Y%m%d)"; now="$(date +%s)"
+  if [ -f "$f" ]; then
+    cd="$(sed -n 1p "$f")"; cn="$(sed -n 2p "$f")"; last="$(sed -n 3p "$f")"
+    [ "$cd" = "$day" ] || { cd="$day"; cn=0; }
+    if [ -n "${last:-}" ]; then gap=$(( now-last )); wait=$(( CX_MIN_GAP + (RANDOM % (CX_JITTER+1)) - gap )); [ "$wait" -gt 0 ] && sleep "$wait"; fi
+  else cd="$day"; cn=0; fi
+  printf '%s\n%s\n%s\n' "$cd" "$(( ${cn:-0}+1 ))" "$(date +%s)" > "$f"
+}
+_backoff() { local n="$1" base; base=$(( 30 * (2 ** (n-1)) )); sleep $(( base + (RANDOM % 30) )); }
 
 cmd=${1:-help}; shift || true
 case "$cmd" in
   add)
-    name=${1:?用法: cx.sh add <名>}
+    name=${1:?用法: cx add <名>}
     home="$PROF_ROOT/$name"; mkdir -p "$home"
     # 默认官方线路(订阅); 要走中转就 add 完手改 $home/config.toml 加 model_providers 段
     [ -f "$home/config.toml" ] || printf 'model = "gpt-5.5"\n' > "$home/config.toml"
@@ -27,14 +58,16 @@ case "$cmd" in
       [ -d "$d" ] || continue
       n=$(basename "$d")
       [ -f "$d/auth.json" ] && s="已登录" || s="未登录"
+      f="$(_usage "$d")"; if [ -f "$f" ] && [ "$(sed -n 1p "$f")" = "$(date +%Y%m%d)" ]; then s="$s 今日用量$(sed -n 2p "$f")/$CX_DAILY_CAP"; fi
       [ "$(cat "$STATE" 2>/dev/null)" = "$n" ] && s="$s ←上次可用"
       echo "$n  $s"
     done
     ;;
   exec)
-    name=${1:?用法: cx.sh exec <名> -- <codex参数>}; shift
+    name=${1:?用法: cx exec <名> -- <codex参数>}; shift
     [ "${1:-}" = "--" ] && shift
-    CODEX_HOME="$PROF_ROOT/$name" codex "$@"
+    home="$PROF_ROOT/$name"; _pace "$home"
+    CODEX_HOME="$home" codex "$@"
     ;;
   auto)
     [ "${1:-}" = "--" ] && shift
@@ -47,25 +80,37 @@ case "$cmd" in
       [ -f "$d/auth.json" ] || continue
       [ "$n" = "$last" ] || order="$order $n"
     done
-    [ -z "$order" ] && { echo "[cx] 没有已登录的 profile, 先 cx.sh add <名>" >&2; exit 2; }
-    # 缓存 stdin(heredoc/管道): 否则第一个号消费掉后, 换号重试时 stdin 已空
+    [ -z "$order" ] && { echo "[cx] 没有已登录的 profile, 先 cx add <名>" >&2; exit 2; }
+    # 缓存 stdin(heredoc/管道): 换号/退避重试都要复用, 否则第一次消费后就空了
     stdin_buf=$(mktemp)
-    if [ ! -t 0 ]; then cat > "$stdin_buf"; fi
+    [ -t 0 ] || cat > "$stdin_buf"
     for n in $order; do
-      errf=$(mktemp)
-      CODEX_HOME="$PROF_ROOT/$n" codex "$@" < "$stdin_buf" 2>"$errf"
-      rc=$?
-      if [ $rc -eq 0 ] && ! grep -qiE "$LIMIT_PAT" "$errf"; then
-        echo "$n" > "$STATE"; cat "$errf" >&2; rm -f "$errf" "$stdin_buf"; exit 0
-      fi
-      if grep -qiE "$LIMIT_PAT" "$errf"; then
-        echo "[cx] profile '$n' 触限, 换下一个号..." >&2; cat "$errf" >&2; rm -f "$errf"; continue
-      fi
-      # 非触限错误: 如实透出, 不再空烧其它号
-      cat "$errf" >&2; rm -f "$errf"; exit $rc
+      home="$PROF_ROOT/$n"
+      # 账号内日软上限: 已达标今日跳过该号(不把号硬刷到限流=最像正常用户)
+      _quota_ok "$home" || { echo "[cx] '$n' 今日已达软上限($CX_DAILY_CAP), 跳过" >&2; continue; }
+      # ★退避优先★: 本号触限先指数退避重试, 试满 CX_BACKOFF_TRIES 次才换下一个号
+      try=1
+      while :; do
+        _pace "$home"
+        errf=$(mktemp)
+        CODEX_HOME="$home" codex "$@" < "$stdin_buf" 2>"$errf"
+        rc=$?
+        if [ $rc -eq 0 ] && ! grep -qiE "$LIMIT_PAT" "$errf"; then
+          echo "$n" > "$STATE"; cat "$errf" >&2; rm -f "$errf" "$stdin_buf"; exit 0
+        fi
+        if grep -qiE "$LIMIT_PAT" "$errf"; then
+          if [ "$try" -lt "$CX_BACKOFF_TRIES" ]; then
+            echo "[cx] '$n' 触限, 退避重试 $try/$CX_BACKOFF_TRIES..." >&2; cat "$errf" >&2; rm -f "$errf"
+            _backoff "$try"; try=$(( try+1 )); continue
+          fi
+          echo "[cx] '$n' 退避$CX_BACKOFF_TRIES次仍触限, 换下一个号" >&2; cat "$errf" >&2; rm -f "$errf"; break
+        fi
+        # 非触限的真实错误: 如实透出, 不空烧其它号
+        cat "$errf" >&2; rm -f "$errf" "$stdin_buf"; exit $rc
+      done
     done
-    echo "[cx] 全部 profile 都触限了" >&2; exit 3
+    echo "[cx] 全部 profile 都触限或达软上限" >&2; rm -f "$stdin_buf"; exit 3
     ;;
   *)
-    grep '^#' "$0" | head -8 ;;
+    grep '^#' "$0" | head -12 ;;
 esac
