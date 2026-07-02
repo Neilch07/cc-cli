@@ -48,12 +48,15 @@ case "$cmd" in
       [ "$n" = "$last" ] || order="$order $n"
     done
     [ -z "$order" ] && { echo "[cx] 没有已登录的 profile, 先 cx.sh add <名>" >&2; exit 2; }
+    # 缓存 stdin(heredoc/管道): 否则第一个号消费掉后, 换号重试时 stdin 已空
+    stdin_buf=$(mktemp)
+    if [ ! -t 0 ]; then cat > "$stdin_buf"; fi
     for n in $order; do
       errf=$(mktemp)
-      CODEX_HOME="$PROF_ROOT/$n" codex "$@" 2>"$errf"
+      CODEX_HOME="$PROF_ROOT/$n" codex "$@" < "$stdin_buf" 2>"$errf"
       rc=$?
       if [ $rc -eq 0 ] && ! grep -qiE "$LIMIT_PAT" "$errf"; then
-        echo "$n" > "$STATE"; cat "$errf" >&2; rm -f "$errf"; exit 0
+        echo "$n" > "$STATE"; cat "$errf" >&2; rm -f "$errf" "$stdin_buf"; exit 0
       fi
       if grep -qiE "$LIMIT_PAT" "$errf"; then
         echo "[cx] profile '$n' 触限, 换下一个号..." >&2; cat "$errf" >&2; rm -f "$errf"; continue
