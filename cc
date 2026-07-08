@@ -131,6 +131,9 @@ cc - Claude Code 账号快速切换工具
   cc add <名称> --key <KEY> [--url <URL>] [--tag <TAG>]
                                                添加 API Key profile
   cc add <名称> --oauth [--tag <TAG>]          添加官方 OAuth 账号
+  cc add <名称> --oauth --config-dir <目录> [--tag <TAG>]
+                                               添加绑定【专属配置目录】的 OAuth 账号
+                                               (CLAUDE_CONFIG_DIR 隔离, 多账号并存互不抢凭证)
   cc use [名称]                                切换到指定 profile（无参数用 fzf 选择）
   cc edit <名称> --key|--url|--tag <值>        就地修改 profile 属性
   cc test [名称]                               测试 profile 连通性
@@ -149,6 +152,9 @@ cc - Claude Code 账号快速切换工具
   cc add work --key sk-ant-api03-xxx --tag production
   cc add runapi --key sk-xxx --url https://runapi.co --tag dev
   cc add personal --oauth
+  cc add miner1 --oauth --config-dir ~/.claude-miner-lane1 --tag miner
+  cc login miner1                              # 登录到专属目录(不动全局 ~/.claude)
+  cc test miner1                               # 探针验证专属目录账号可用
   cc use work
   cc use                                       # fzf 交互选择
   cc edit work --key sk-new-key
@@ -326,6 +332,7 @@ cmd_add() {
     local key=""
     local url=""
     local tag=""
+    local config_dir=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -351,6 +358,14 @@ cmd_add() {
             --oauth)
                 type="oauth"
                 shift
+                ;;
+            --config-dir)
+                if [ $# -lt 2 ]; then
+                    echo -e "${RED}--config-dir 后面需要跟目录路径${NC}"
+                    return 1
+                fi
+                config_dir="${2/#\~/$HOME}"
+                shift 2
                 ;;
             --tag)
                 if [ $# -lt 2 ]; then
@@ -413,8 +428,17 @@ cmd_add() {
         fi
     fi
 
+    if [ -n "$config_dir" ]; then
+        if [ "$type" != "oauth" ]; then
+            echo -e "${RED}--config-dir 仅支持 --oauth 类型${NC}"
+            return 1
+        fi
+        profiles_data=$(echo "$profiles_data" | jq --arg name "$name" --arg cd "$config_dir" '.profiles[$name].configDir = $cd')
+    fi
+
     write_profiles "$profiles_data"
     echo -e "${GREEN}✓ 已添加 profile: ${BOLD}$name${NC} (${type})"
+    [ -n "$config_dir" ] && echo -e "  专属配置目录: $config_dir (登录: cc login $name)"
     [ -n "$tag" ] && echo -e "  标签: $tag"
 
     # 如果是第一个 profile，自动激活
@@ -508,6 +532,27 @@ cmd_use() {
         fi
 
     elif [ "$type" = "oauth" ]; then
+        local use_config_dir
+        use_config_dir=$(read_profiles ".profiles[\"$name\"].configDir // empty")
+        if [ -n "$use_config_dir" ]; then
+            # 专属配置目录 profile: 全局 ~/.claude 槽不动, 新终端经 env.sh 指向该目录
+            {
+                echo "unset ANTHROPIC_API_KEY 2>/dev/null || true"
+                echo "unset ANTHROPIC_AUTH_TOKEN 2>/dev/null || true"
+                echo "unset ANTHROPIC_BASE_URL 2>/dev/null || true"
+                echo "export CLAUDE_CONFIG_DIR=\"$use_config_dir\""
+            } > "$ENV_FILE"
+            local pd
+            pd=$(jq --arg name "$name" '.active = $name' "$PROFILES_FILE")
+            write_profiles "$pd"
+            if [ -f "$use_config_dir/.credentials.json" ]; then
+                echo -e "${GREEN}✓ 已切换到: ${BOLD}$name${NC} (OAuth·专属目录 $use_config_dir)"
+            else
+                echo -e "${YELLOW}✓ 已切换到 $name, 但 $use_config_dir 尚未登录 → cc login $name${NC}"
+            fi
+            echo -e "${CYAN}  新终端自动生效; 当前终端: source ~/.cc-profiles/env.sh${NC}"
+            return 0
+        fi
         # 切换前：备份当前激活的 OAuth profile 的凭证
         local prev_active
         prev_active=$(get_active)
@@ -539,6 +584,7 @@ cmd_use() {
         {
             echo "unset ANTHROPIC_API_KEY 2>/dev/null || true"
             echo "unset ANTHROPIC_AUTH_TOKEN 2>/dev/null || true"
+            echo "unset CLAUDE_CONFIG_DIR 2>/dev/null || true"
             echo "unset ANTHROPIC_BASE_URL 2>/dev/null || true"
         } > "$ENV_FILE"
 
@@ -727,8 +773,21 @@ cmd_test() {
     type=$(read_profiles ".profiles[\"$name\"].type")
 
     if [ "$type" != "api_key" ]; then
-        echo -e "${YELLOW}OAuth 类型 profile 无法通过 API 测试，请手动验证${NC}"
-        return 1
+        local test_config_dir
+        test_config_dir=$(read_profiles ".profiles[\"$name\"].configDir // empty")
+        if [ -z "$test_config_dir" ]; then
+            echo -e "${YELLOW}OAuth 类型 profile 无法通过 API 测试，请手动验证${NC}"
+            return 1
+        fi
+        echo -ne "${CYAN}测试 profile: ${BOLD}$name${NC} (专属目录 $test_config_dir) ..."
+        if env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL \
+             CLAUDE_CONFIG_DIR="$test_config_dir" claude -p --model haiku "ok" >/dev/null 2>&1; then
+            echo -e " ${GREEN}✓ 可用${NC}"
+            return 0
+        else
+            echo -e " ${RED}✗ 失败(未登录/过期 → cc login $name)${NC}"
+            return 1
+        fi
     fi
 
     local key url_val base_url
@@ -932,12 +991,14 @@ _apply_profile() {
         if [ -n "$url" ]; then
             {
                 echo "unset ANTHROPIC_API_KEY 2>/dev/null || true"
+                echo "unset CLAUDE_CONFIG_DIR 2>/dev/null || true"
                 echo "export ANTHROPIC_AUTH_TOKEN=\"$key\""
                 echo "export ANTHROPIC_BASE_URL=\"$url\""
             } > "$ENV_FILE"
         else
             {
                 echo "unset ANTHROPIC_AUTH_TOKEN 2>/dev/null || true"
+                echo "unset CLAUDE_CONFIG_DIR 2>/dev/null || true"
                 echo "export ANTHROPIC_API_KEY=\"$key\""
                 echo "unset ANTHROPIC_BASE_URL 2>/dev/null || true"
             } > "$ENV_FILE"
@@ -977,8 +1038,16 @@ cmd_exec() {
     type=$(read_profiles ".profiles[\"$name\"].type")
 
     if [ "$type" != "api_key" ]; then
-        echo -e "${RED}exec 仅支持 api_key 类型 profile${NC}"
-        return 1
+        local exec_config_dir
+        exec_config_dir=$(read_profiles ".profiles[\"$name\"].configDir // empty")
+        if [ -z "$exec_config_dir" ]; then
+            echo -e "${RED}exec 支持 api_key 或带 --config-dir 的 oauth profile${NC}"
+            return 1
+        fi
+        echo -e "${CYAN}临时使用 profile: ${BOLD}$name${NC} (专属目录 $exec_config_dir) 执行命令..."
+        env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL \
+            CLAUDE_CONFIG_DIR="$exec_config_dir" "$@"
+        return $?
     fi
 
     local key url
@@ -1234,6 +1303,22 @@ cmd_login() {
     if [ "$type" != "oauth" ]; then
         echo -e "${RED}login 仅适用于 OAuth 类型 profile${NC}"
         return 1
+    fi
+
+    local login_config_dir
+    login_config_dir=$(read_profiles ".profiles[\"$name\"].configDir // empty")
+    if [ -n "$login_config_dir" ]; then
+        # 专属配置目录 profile: 直接登录到该目录, 不动全局 ~/.claude 与 OAuth 缓存
+        mkdir -p "$login_config_dir"; chmod 700 "$login_config_dir"
+        echo -e "${CYAN}登录到专属目录: ${BOLD}$name${NC} → $login_config_dir"
+        env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_BASE_URL \
+            CLAUDE_CONFIG_DIR="$login_config_dir" claude /login
+        if [ -f "$login_config_dir/.credentials.json" ]; then
+            echo -e "${GREEN}✓ 已登录: $login_config_dir${NC}"
+        else
+            echo -e "${YELLOW}⚠ 未检测到凭证文件, 登录可能未完成${NC}"
+        fi
+        return 0
     fi
 
     echo -e "${CYAN}强制刷新 OAuth 登录: ${BOLD}$name${NC}"
